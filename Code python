@@ -1,0 +1,915 @@
+
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import random
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import DefaultDict, Sequence
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+
+KEEP = 0
+CHANGE = 1
+NS_GREEN = 0
+EW_GREEN = 1
+
+
+@dataclass(frozen=True)
+class Config:
+    episodes: int = 1800
+    test_scenarios: int = 48
+    training_seeds: tuple[int, ...] = (17, 43, 91)
+
+    steps_per_episode: int = 180
+    seconds_per_step: float = 5.0
+    service_per_green_lane: int = 4
+
+    min_phase_steps: int = 2
+    max_phase_steps: int = 10
+    fixed_phase_steps: int = 5
+
+    beta: float = 4.0
+    gamma: float = 0.94
+    alpha_0: float = 0.24
+    alpha_decay: float = 0.0012
+    epsilon_0: float = 1.0
+    epsilon_min: float = 0.025
+    epsilon_decay: float = 0.006
+    smoothing_window: int = 75
+
+
+@dataclass
+class EpisodeResult:
+    cumulative_reward: float
+    queue_reward_term: float
+    change_reward_term: float
+    mean_congestion: float
+    mean_wait_per_vehicle: float
+    change_rate: float
+    changes: int
+    total_arrivals: int
+
+
+class Intersection:
+    """Environnement a quatre files N, S, E et O."""
+
+    NS_LANES = (0, 1)
+    EW_LANES = (2, 3)
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.queues = np.zeros(4, dtype=np.int64)
+        self.phase = NS_GREEN
+        self.phase_age = 0
+        self.t = 0
+        self.arrivals = np.empty((0, 4), dtype=np.int64)
+
+        self.cumulative_reward = 0.0
+        self.queue_reward_term = 0.0
+        self.change_reward_term = 0.0
+        self.queue_time_integral = 0.0
+        self.total_arrivals = 0
+        self.changes = 0
+
+    def reset(self, arrivals: np.ndarray) -> tuple[int, ...]:
+        if arrivals.ndim != 2 or arrivals.shape[1] != 4:
+            raise ValueError("arrivals doit avoir la forme (nombre_de_pas, 4).")
+
+        self.queues = np.zeros(4, dtype=np.int64)
+        self.phase = NS_GREEN
+        self.phase_age = 0
+        self.t = 0
+        self.arrivals = arrivals
+
+        self.cumulative_reward = 0.0
+        self.queue_reward_term = 0.0
+        self.change_reward_term = 0.0
+        self.queue_time_integral = 0.0
+        self.total_arrivals = 0
+        self.changes = 0
+        return self.state()
+
+    def valid_actions(self) -> tuple[int, ...]:
+        if self.phase_age < self.config.min_phase_steps:
+            return (KEEP,)
+        if self.phase_age >= self.config.max_phase_steps:
+            return (CHANGE,)
+        return (KEEP, CHANGE)
+
+    @staticmethod
+    def _queue_bin(queue_length: int) -> int:
+        thresholds = (0, 3, 7, 12, 20, 32, 48)
+        return sum(queue_length > threshold for threshold in thresholds)
+
+    def state(self) -> tuple[int, ...]:
+        ns_queue = int(self.queues[0] + self.queues[1])
+        ew_queue = int(self.queues[2] + self.queues[3])
+        imbalance = int(np.clip((ns_queue - ew_queue) // 8, -4, 4)) + 4
+
+        return (
+            self._queue_bin(ns_queue),
+            self._queue_bin(ew_queue),
+            self.phase,
+            min(self.phase_age, self.config.max_phase_steps - 1),
+            imbalance,
+        )
+
+    def reward(self, action: int) -> tuple[float, float, float]:
+        """
+        Calcule strictement :
+
+            r_t = -sum_i q_i(t) - beta * 1_{changement}
+
+        Cette fonction est appelee avant toute modification de self.queues.
+        """
+        queue_term = -float(np.sum(self.queues))
+        indicator_change = 1.0 if action == CHANGE else 0.0
+        change_term = -self.config.beta * indicator_change
+        return queue_term + change_term, queue_term, change_term
+
+    def _transition(self, action: int) -> None:
+        """
+        Produit q(t+1) a partir de q(t).
+
+        Lors d'un changement, le pas represente le temps jaune/perdu :
+        aucune voie n'est servie. Sinon, les deux voies de l'axe vert
+        peuvent evacuer des vehicules.
+        """
+        new_arrivals = self.arrivals[self.t]
+        service = np.zeros(4, dtype=np.int64)
+
+        if action == CHANGE:
+            self.phase = EW_GREEN if self.phase == NS_GREEN else NS_GREEN
+            self.phase_age = 0
+            self.changes += 1
+        else:
+            green_lanes = (
+                self.NS_LANES if self.phase == NS_GREEN else self.EW_LANES
+            )
+            for lane in green_lanes:
+                service[lane] = self.config.service_per_green_lane
+            self.phase_age += 1
+
+        # q_i(t+1) = max(0, q_i(t) + lambda_i(t) - service_i(t))
+        self.queues = np.maximum(
+            0,
+            self.queues + new_arrivals - service,
+        ).astype(np.int64)
+        self.total_arrivals += int(np.sum(new_arrivals))
+
+    def step(self, requested_action: int) -> tuple[tuple[int, ...], float, bool]:
+        valid = self.valid_actions()
+        action = requested_action if requested_action in valid else valid[0]
+
+        # q(t) est utilise ici, avant la transition vers q(t+1).
+        reward, queue_term, change_term = self.reward(action)
+        congestion_t = float(np.sum(self.queues))
+
+        self.cumulative_reward += reward
+        self.queue_reward_term += queue_term
+        self.change_reward_term += change_term
+        self.queue_time_integral += congestion_t * self.config.seconds_per_step
+
+        self._transition(action)
+        self.t += 1
+        done = self.t >= len(self.arrivals)
+        return self.state(), reward, done
+
+    def result(self) -> EpisodeResult:
+        expected_reward = self.queue_reward_term + self.change_reward_term
+        if not math.isclose(
+            self.cumulative_reward,
+            expected_reward,
+            abs_tol=1e-9,
+        ):
+            raise RuntimeError("La decomposition de la recompense est incoherente.")
+
+        n_steps = max(1, len(self.arrivals))
+        n_vehicles = max(1, self.total_arrivals)
+        return EpisodeResult(
+            cumulative_reward=self.cumulative_reward,
+            queue_reward_term=self.queue_reward_term,
+            change_reward_term=self.change_reward_term,
+            mean_congestion=self.queue_time_integral
+            / (n_steps * self.config.seconds_per_step),
+            mean_wait_per_vehicle=self.queue_time_integral / n_vehicles,
+            change_rate=self.changes / n_steps,
+            changes=self.changes,
+            total_arrivals=self.total_arrivals,
+        )
+
+
+class QLearningAgent:
+    def __init__(self, config: Config, seed: int):
+        self.config = config
+        self.q_table: DefaultDict[tuple[int, ...], np.ndarray] = defaultdict(
+            lambda: np.zeros(2, dtype=float)
+        )
+        self.rng = random.Random(seed)
+
+    def choose_action(
+        self,
+        state: tuple[int, ...],
+        valid_actions: Sequence[int],
+        epsilon: float,
+    ) -> int:
+        if len(valid_actions) == 1:
+            return valid_actions[0]
+        if self.rng.random() < epsilon:
+            return self.rng.choice(tuple(valid_actions))
+
+        values = self.q_table[state]
+        best_value = max(values[action] for action in valid_actions)
+        best_actions = [
+            action
+            for action in valid_actions
+            if math.isclose(values[action], best_value, abs_tol=1e-12)
+        ]
+        return self.rng.choice(best_actions)
+
+    def update(
+        self,
+        state: tuple[int, ...],
+        action: int,
+        reward: float,
+        next_state: tuple[int, ...],
+        next_valid_actions: Sequence[int],
+        alpha: float,
+        done: bool,
+    ) -> None:
+        current_q = self.q_table[state][action]
+        future_q = 0.0
+        if not done:
+            future_q = max(
+                self.q_table[next_state][next_action]
+                for next_action in next_valid_actions
+            )
+
+        target = reward + self.config.gamma * future_q
+        self.q_table[state][action] = current_q + alpha * (target - current_q)
+
+
+def verify_reward_formula(config: Config) -> None:
+    """Test automatique de la formule avant tout apprentissage."""
+    env = Intersection(config)
+    env.reset(np.zeros((1, 4), dtype=np.int64))
+    env.queues = np.array((3, 5, 7, 11), dtype=np.int64)
+    env.phase_age = config.min_phase_steps
+
+    keep_reward, keep_queue, keep_change = env.reward(KEEP)
+    expected_keep = -(3 + 5 + 7 + 11)
+    if not math.isclose(keep_reward, expected_keep):
+        raise RuntimeError("Erreur dans le terme -sum_i q_i(t).")
+    if keep_change != 0.0 or keep_queue != expected_keep:
+        raise RuntimeError("Erreur pour l'action GARDER.")
+
+    change_reward, change_queue, change_penalty = env.reward(CHANGE)
+    expected_change = expected_keep - config.beta
+    if not math.isclose(change_reward, expected_change):
+        raise RuntimeError("Erreur dans la penalite beta * indicateur.")
+    if change_queue != expected_keep or change_penalty != -config.beta:
+        raise RuntimeError("Erreur pour l'action CHANGER.")
+
+
+def _axis_rates(
+    dominant_axis: int,
+    dominant_rate: float,
+    minor_rate: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    lane_variation = rng.uniform(0.88, 1.12, size=4)
+    if dominant_axis == NS_GREEN:
+        rates = np.array(
+            (dominant_rate, dominant_rate, minor_rate, minor_rate)
+        )
+    else:
+        rates = np.array(
+            (minor_rate, minor_rate, dominant_rate, dominant_rate)
+        )
+    return rates * lane_variation
+
+
+def generate_arrivals(
+    config: Config,
+    seed: int,
+    test_mode: bool = False,
+) -> np.ndarray:
+    """Genere des flux variables, asymetriques et reproductibles."""
+    rng = np.random.default_rng(seed)
+    steps = config.steps_per_episode
+    rates = np.zeros((steps, 4), dtype=float)
+
+    if test_mode and rng.random() < 0.34:
+        dominant_rate = float(rng.uniform(1.48, 1.78))
+        minor_rate = float(rng.uniform(0.28, 0.52))
+    elif test_mode:
+        dominant_rate = float(rng.uniform(1.02, 1.30))
+        minor_rate = float(rng.uniform(0.58, 0.86))
+    else:
+        dominant_rate = float(rng.uniform(1.34, 1.72))
+        minor_rate = float(rng.uniform(0.25, 0.55))
+
+    patterns = (
+        (NS_GREEN, NS_GREEN, EW_GREEN),
+        (EW_GREEN, EW_GREEN, NS_GREEN),
+        (NS_GREEN, EW_GREEN, NS_GREEN),
+        (EW_GREEN, NS_GREEN, EW_GREEN),
+        (NS_GREEN, NS_GREEN, NS_GREEN),
+        (EW_GREEN, EW_GREEN, EW_GREEN),
+    )
+    axes = patterns[int(rng.integers(0, len(patterns)))]
+    cuts = (0, steps // 3, 2 * steps // 3, steps)
+
+    for segment, axis in enumerate(axes):
+        start, end = cuts[segment], cuts[segment + 1]
+        rates[start:end] = _axis_rates(
+            axis,
+            dominant_rate * float(rng.uniform(0.92, 1.08)),
+            minor_rate * float(rng.uniform(0.88, 1.12)),
+            rng,
+        )
+
+    time = np.arange(steps)
+    wave = 1.0 + 0.10 * np.sin(
+        2 * np.pi * time / float(rng.integers(45, 80))
+        + rng.uniform(0, 2 * np.pi)
+    )
+    rates *= wave[:, None]
+    return rng.poisson(rates).astype(np.int64)
+
+
+def train_one_seed(
+    config: Config,
+    seed: int,
+) -> tuple[QLearningAgent, list[EpisodeResult]]:
+    env = Intersection(config)
+    agent = QLearningAgent(config, seed + 10_000)
+    history: list[EpisodeResult] = []
+
+    for episode in range(config.episodes):
+        arrivals = generate_arrivals(config, seed * 1_000_003 + episode)
+        state = env.reset(arrivals)
+
+        alpha = config.alpha_0 / (1.0 + config.alpha_decay * episode)
+        epsilon = config.epsilon_min + (
+            config.epsilon_0 - config.epsilon_min
+        ) * math.exp(-config.epsilon_decay * episode)
+
+        while True:
+            valid_actions = env.valid_actions()
+            action = agent.choose_action(state, valid_actions, epsilon)
+            next_state, reward, done = env.step(action)
+            agent.update(
+                state,
+                action,
+                reward,
+                next_state,
+                env.valid_actions(),
+                alpha,
+                done,
+            )
+            state = next_state
+            if done:
+                break
+
+        history.append(env.result())
+        if episode == 0 or (episode + 1) % 100 == 0:
+            recent = history[-min(50, len(history)) :]
+            mean_congestion = float(
+                np.mean([result.mean_congestion for result in recent])
+            )
+            print(
+                f"Graine {seed:3d} | episode {episode + 1:4d}/"
+                f"{config.episodes} | congestion recente="
+                f"{mean_congestion:6.2f}"
+            )
+
+    return agent, history
+
+
+def fixed_action(env: Intersection) -> int:
+    return CHANGE if env.phase_age >= env.config.fixed_phase_steps else KEEP
+
+
+def evaluate(
+    config: Config,
+    arrivals: np.ndarray,
+    agent: QLearningAgent | None,
+) -> EpisodeResult:
+    env = Intersection(config)
+    state = env.reset(arrivals)
+
+    while True:
+        if agent is None:
+            action = fixed_action(env)
+        else:
+            action = agent.choose_action(state, env.valid_actions(), epsilon=0.0)
+
+        state, _, done = env.step(action)
+        if done:
+            return env.result()
+
+
+def mean_agent_result(results: Sequence[EpisodeResult]) -> EpisodeResult:
+    return EpisodeResult(
+        cumulative_reward=float(
+            np.mean([result.cumulative_reward for result in results])
+        ),
+        queue_reward_term=float(
+            np.mean([result.queue_reward_term for result in results])
+        ),
+        change_reward_term=float(
+            np.mean([result.change_reward_term for result in results])
+        ),
+        mean_congestion=float(
+            np.mean([result.mean_congestion for result in results])
+        ),
+        mean_wait_per_vehicle=float(
+            np.mean([result.mean_wait_per_vehicle for result in results])
+        ),
+        change_rate=float(
+            np.mean([result.change_rate for result in results])
+        ),
+        changes=int(round(np.mean([result.changes for result in results]))),
+        total_arrivals=results[0].total_arrivals,
+    )
+
+
+def moving_average(values: Sequence[float], window: int) -> np.ndarray:
+    data = np.asarray(values, dtype=float)
+    if window <= 1:
+        return data.copy()
+    window = min(window, len(data))
+    prefix = np.array(
+        [np.mean(data[: index + 1]) for index in range(window - 1)]
+    )
+    kernel = np.ones(window, dtype=float) / window
+    return np.concatenate((prefix, np.convolve(data, kernel, mode="valid")))
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = (
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _nice_ticks(low: float, high: float, target: int = 7) -> list[float]:
+    if math.isclose(low, high):
+        return [low]
+    raw_step = (high - low) / max(1, target - 1)
+    magnitude = 10 ** math.floor(math.log10(abs(raw_step)))
+    normalized = raw_step / magnitude
+    if normalized <= 1:
+        step = magnitude
+    elif normalized <= 2:
+        step = 2 * magnitude
+    elif normalized <= 5:
+        step = 5 * magnitude
+    else:
+        step = 10 * magnitude
+    start = math.floor(low / step) * step
+    end = math.ceil(high / step) * step
+    return list(np.arange(start, end + 0.1 * step, step))
+
+
+def _center_text(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    y: float,
+    text: str,
+    font: ImageFont.ImageFont,
+) -> None:
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(
+        (x - (box[2] - box[0]) / 2, y - (box[3] - box[1]) / 2),
+        text,
+        font=font,
+        fill=(20, 20, 20),
+    )
+
+
+def save_learning_plot(
+    raw_values: Sequence[float],
+    smooth_values: Sequence[float],
+    output: Path,
+    title: str,
+    y_label: str,
+    include_zero: bool = False,
+) -> None:
+    width, height = 1500, 900
+    left, right, top, bottom = 205, 55, 80, 125
+    x0, x1 = left, width - right
+    y0, y1 = top, height - bottom
+
+    raw = np.asarray(raw_values, dtype=float)
+    smooth = np.asarray(smooth_values, dtype=float)
+    data_low = float(min(np.min(raw), np.min(smooth)))
+    data_high = float(max(np.max(raw), np.max(smooth)))
+    padding = max(1.0, 0.08 * (data_high - data_low))
+    low, high = data_low - padding, data_high + padding
+    if include_zero:
+        low = min(0.0, low)
+    ticks = _nice_ticks(low, high)
+    low, high = ticks[0], ticks[-1]
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    axis_font = _font(27)
+    label_font = _font(39)
+    title_font = _font(35, bold=True)
+    legend_font = _font(25)
+
+    def px(index: int) -> float:
+        return x0 + index * (x1 - x0) / max(1, len(raw) - 1)
+
+    def py(value: float) -> float:
+        return y1 - (value - low) * (y1 - y0) / max(1e-12, high - low)
+
+    for tick in ticks:
+        y = py(tick)
+        draw.line((x0, y, x1, y), fill=(225, 225, 225), width=1)
+        label = f"{tick:.0f}"
+        box = draw.textbbox((0, 0), label, font=axis_font)
+        draw.text(
+            (x0 - 24 - (box[2] - box[0]), y - 15),
+            label,
+            font=axis_font,
+            fill=(25, 25, 25),
+        )
+
+    for episode in range(0, len(raw), 250):
+        x = px(episode)
+        draw.line((x, y0, x, y1), fill=(235, 235, 235), width=1)
+        _center_text(draw, x, y1 + 32, str(episode), axis_font)
+
+    raw_points = [(px(i), py(float(value))) for i, value in enumerate(raw)]
+    smooth_points = [
+        (px(i), py(float(value))) for i, value in enumerate(smooth)
+    ]
+    draw.line(raw_points, fill=(110, 166, 205), width=2)
+    draw.line(smooth_points, fill=(17, 91, 150), width=5)
+    draw.rectangle((x0, y0, x1, y1), outline=(30, 30, 30), width=2)
+
+    _center_text(draw, (x0 + x1) / 2, 33, title, title_font)
+    _center_text(draw, (x0 + x1) / 2, height - 42, "Episode", label_font)
+
+    vertical = Image.new("RGBA", (650, 65), (255, 255, 255, 0))
+    vertical_draw = ImageDraw.Draw(vertical)
+    vertical_draw.text((4, 4), y_label, font=label_font, fill=(20, 20, 20))
+    vertical = vertical.rotate(90, expand=True)
+    image.paste(vertical, (10, int((y0 + y1 - vertical.height) / 2)), vertical)
+
+    legend_x, legend_y = x1 - 310, y0 + 35
+    draw.rectangle(
+        (legend_x - 20, legend_y - 20, x1 - 20, legend_y + 78),
+        fill="white",
+        outline=(180, 180, 180),
+    )
+    draw.line(
+        (legend_x, legend_y, legend_x + 65, legend_y),
+        fill=(110, 166, 205),
+        width=3,
+    )
+    draw.text(
+        (legend_x + 80, legend_y - 16),
+        "brut",
+        font=legend_font,
+        fill=(25, 25, 25),
+    )
+    draw.line(
+        (legend_x, legend_y + 45, legend_x + 65, legend_y + 45),
+        fill=(17, 91, 150),
+        width=6,
+    )
+    draw.text(
+        (legend_x + 80, legend_y + 29),
+        "tendance lissee",
+        font=legend_font,
+        fill=(25, 25, 25),
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output)
+
+
+def save_bar_plot(
+    fixed_values: Sequence[float],
+    rl_values: Sequence[float],
+    title: str,
+    y_label: str,
+    output: Path,
+) -> None:
+    fixed = np.asarray(fixed_values, dtype=float)
+    rl = np.asarray(rl_values, dtype=float)
+    means = (float(np.mean(fixed)), float(np.mean(rl)))
+    sems = (
+        float(np.std(fixed, ddof=1) / math.sqrt(len(fixed))),
+        float(np.std(rl, ddof=1) / math.sqrt(len(rl))),
+    )
+    gain = 100 * (means[0] - means[1]) / means[0]
+
+    width, height = 1100, 850
+    left, right, top, bottom = 165, 70, 105, 145
+    x0, x1, y0, y1 = left, width - right, top, height - bottom
+    ticks = _nice_ticks(0, max(means[0], means[1]) * 1.65)
+    high = ticks[-1]
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    axis_font = _font(28)
+    label_font = _font(39)
+    title_font = _font(35, bold=True)
+    value_font = _font(30, bold=True)
+
+    def py(value: float) -> float:
+        return y1 - value * (y1 - y0) / high
+
+    for tick in ticks:
+        y = py(tick)
+        draw.line((x0, y, x1, y), fill=(225, 225, 225), width=1)
+        draw.text((48, y - 15), f"{tick:.0f}", font=axis_font, fill=(25, 25, 25))
+
+    centers = (x0 + (x1 - x0) * 0.32, x0 + (x1 - x0) * 0.72)
+    colors = ((93, 156, 196), (44, 113, 157))
+    names = ("Cycle fixe", "Agent RL")
+    bar_width = 220
+
+    for center, mean, sem, color, name in zip(
+        centers, means, sems, colors, names
+    ):
+        top_y = py(mean)
+        draw.rectangle(
+            (center - bar_width / 2, top_y, center + bar_width / 2, y1),
+            fill=color,
+            outline=(30, 30, 30),
+            width=2,
+        )
+        error_top = py(mean + 1.96 * sem)
+        error_bottom = py(max(0.0, mean - 1.96 * sem))
+        draw.line((center, error_top, center, error_bottom), fill=(20, 20, 20), width=3)
+        draw.line((center - 25, error_top, center + 25, error_top), fill=(20, 20, 20), width=3)
+        draw.line((center - 25, error_bottom, center + 25, error_bottom), fill=(20, 20, 20), width=3)
+        _center_text(draw, center, top_y - 34, f"{mean:.1f}", value_font)
+        _center_text(draw, center, y1 + 42, name, axis_font)
+
+    draw.rectangle((x0, y0, x1, y1), outline=(30, 30, 30), width=2)
+    _center_text(draw, (x0 + x1) / 2, 45, title, title_font)
+
+    vertical = Image.new("RGBA", (650, 65), (255, 255, 255, 0))
+    vertical_draw = ImageDraw.Draw(vertical)
+    vertical_draw.text((4, 4), y_label, font=label_font, fill=(20, 20, 20))
+    vertical = vertical.rotate(90, expand=True)
+    image.paste(vertical, (8, int((y0 + y1 - vertical.height) / 2)), vertical)
+    _center_text(
+        draw,
+        (x0 + x1) / 2,
+        height - 35,
+        f"Reduction moyenne : {gain:.1f} %",
+        axis_font,
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output)
+
+
+def save_training_csv(
+    histories: Sequence[Sequence[EpisodeResult]],
+    seeds: Sequence[int],
+    beta: float,
+    output: Path,
+) -> None:
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            (
+                "graine",
+                "episode",
+                "beta",
+                "recompense_cumulee",
+                "terme_files_moins_somme_q",
+                "terme_changements_moins_beta_indicateur",
+                "nombre_changements",
+                "congestion_moyenne",
+                "attente_moyenne_vehicule_s",
+                "taux_changement",
+            )
+        )
+        for seed, history in zip(seeds, histories):
+            for episode, result in enumerate(history, start=1):
+                writer.writerow(
+                    (
+                        seed,
+                        episode,
+                        f"{beta:.6f}",
+                        f"{result.cumulative_reward:.6f}",
+                        f"{result.queue_reward_term:.6f}",
+                        f"{result.change_reward_term:.6f}",
+                        result.changes,
+                        f"{result.mean_congestion:.6f}",
+                        f"{result.mean_wait_per_vehicle:.6f}",
+                        f"{result.change_rate:.6f}",
+                    )
+                )
+
+
+def save_test_csv(
+    fixed_results: Sequence[EpisodeResult],
+    rl_results: Sequence[EpisodeResult],
+    output: Path,
+) -> None:
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            (
+                "scenario",
+                "congestion_cycle_fixe",
+                "congestion_agent_rl",
+                "attente_cycle_fixe_s",
+                "attente_agent_rl_s",
+                "recompense_cycle_fixe",
+                "recompense_agent_rl",
+                "changements_cycle_fixe",
+                "changements_agent_rl",
+            )
+        )
+        for index, (fixed, rl) in enumerate(
+            zip(fixed_results, rl_results),
+            start=1,
+        ):
+            writer.writerow(
+                (
+                    index,
+                    f"{fixed.mean_congestion:.6f}",
+                    f"{rl.mean_congestion:.6f}",
+                    f"{fixed.mean_wait_per_vehicle:.6f}",
+                    f"{rl.mean_wait_per_vehicle:.6f}",
+                    f"{fixed.cumulative_reward:.6f}",
+                    f"{rl.cumulative_reward:.6f}",
+                    fixed.changes,
+                    rl.changes,
+                )
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Q-Learning avec r_t=-sum(q_i(t))-beta*1_changement."
+    )
+    parser.add_argument("--episodes", type=int, default=1800)
+    parser.add_argument("--tests", type=int, default=48)
+    parser.add_argument("--beta", type=float, default=4.0)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("resultats_tipe_final_corriges"),
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.episodes <= 0 or args.tests <= 0:
+        raise ValueError("Le nombre d'episodes et de tests doit etre positif.")
+    if args.beta < 0:
+        raise ValueError("beta doit etre positif ou nul.")
+
+    config = Config(
+        episodes=args.episodes,
+        test_scenarios=args.tests,
+        beta=args.beta,
+    )
+    verify_reward_formula(config)
+    print(
+        "Formule verifiee : "
+        "r_t = -sum_i q_i(t) - beta * 1_{changement}"
+    )
+
+    output = args.output
+    output.mkdir(parents=True, exist_ok=True)
+
+    agents: list[QLearningAgent] = []
+    histories: list[list[EpisodeResult]] = []
+    print(
+        f"Apprentissage : {len(config.training_seeds)} graines x "
+        f"{config.episodes} episodes"
+    )
+    for seed in config.training_seeds:
+        agent, history = train_one_seed(config, seed)
+        agents.append(agent)
+        histories.append(history)
+
+    reward_curves = np.array(
+        [
+            [result.cumulative_reward for result in history]
+            for history in histories
+        ]
+    )
+    congestion_curves = np.array(
+        [
+            [result.mean_congestion for result in history]
+            for history in histories
+        ]
+    )
+    mean_reward = np.mean(reward_curves, axis=0)
+    mean_congestion = np.mean(congestion_curves, axis=0)
+
+    fixed_results: list[EpisodeResult] = []
+    rl_results: list[EpisodeResult] = []
+    print(f"\nEvaluation sur {config.test_scenarios} scenarios inedits")
+    for scenario in range(config.test_scenarios):
+        arrivals = generate_arrivals(
+            config,
+            8_000_000 + scenario * 7919,
+            test_mode=True,
+        )
+        fixed_results.append(evaluate(config, arrivals, agent=None))
+        rl_results.append(
+            mean_agent_result(
+                [evaluate(config, arrivals, agent) for agent in agents]
+            )
+        )
+
+    fixed_congestion = [result.mean_congestion for result in fixed_results]
+    rl_congestion = [result.mean_congestion for result in rl_results]
+    fixed_wait = [result.mean_wait_per_vehicle for result in fixed_results]
+    rl_wait = [result.mean_wait_per_vehicle for result in rl_results]
+
+    save_learning_plot(
+        mean_reward,
+        moving_average(mean_reward, config.smoothing_window),
+        output / "figure_33_recompense_cumulee.png",
+        "Apprentissage Q-Learning",
+        "Recompense cumulee",
+    )
+    save_learning_plot(
+        mean_congestion,
+        moving_average(mean_congestion, config.smoothing_window),
+        output / "figure_34_congestion_apprentissage.png",
+        "Congestion pendant l'apprentissage",
+        "Congestion moyenne",
+        include_zero=True,
+    )
+    save_bar_plot(
+        fixed_congestion,
+        rl_congestion,
+        f"Evaluation sur {config.test_scenarios} scenarios",
+        "Congestion moyenne",
+        output / "figure_35_comparaison_congestion.png",
+    )
+    save_bar_plot(
+        fixed_wait,
+        rl_wait,
+        "Attente moyenne estimee",
+        "Attente moyenne par vehicule (s)",
+        output / "figure_36_temps_attente.png",
+    )
+    save_training_csv(
+        histories,
+        config.training_seeds,
+        config.beta,
+        output / "apprentissage_3_graines.csv",
+    )
+    save_test_csv(
+        fixed_results,
+        rl_results,
+        output / "evaluation_48_scenarios.csv",
+    )
+
+    fixed_congestion_mean = float(np.mean(fixed_congestion))
+    rl_congestion_mean = float(np.mean(rl_congestion))
+    fixed_wait_mean = float(np.mean(fixed_wait))
+    rl_wait_mean = float(np.mean(rl_wait))
+    congestion_gain = 100 * (
+        fixed_congestion_mean - rl_congestion_mean
+    ) / fixed_congestion_mean
+    wait_gain = 100 * (fixed_wait_mean - rl_wait_mean) / fixed_wait_mean
+
+    print("\nResultats moyens")
+    print(f"beta = {config.beta:.2f}")
+    print(
+        f"Congestion : cycle fixe={fixed_congestion_mean:.2f}, "
+        f"agent RL={rl_congestion_mean:.2f}, gain={congestion_gain:.1f} %"
+    )
+    print(
+        f"Attente : cycle fixe={fixed_wait_mean:.2f} s, "
+        f"agent RL={rl_wait_mean:.2f} s, gain={wait_gain:.1f} %"
+    )
+    print(f"Fichiers crees dans : {output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
